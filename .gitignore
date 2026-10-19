@@ -4,3 +4,4 @@ __pycache__/
 output/
 cache/
 ~$*
+.streamlit/secrets.toml

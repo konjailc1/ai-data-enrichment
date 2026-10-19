@@ -14,9 +14,11 @@ import random
 import re
 import time
 import unicodedata
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import BinaryIO
 
 import pandas as pd
 from openpyxl import Workbook
@@ -711,12 +713,12 @@ def _cache_key(model: str, payload: str) -> str:
     return digest.hexdigest()
 
 
-def _cache_path(key: str) -> Path:
-    return CACHE_DIR / f"{key}.json"
+def _cache_path(key: str, cache_dir: Path | None = None) -> Path:
+    return (cache_dir or CACHE_DIR) / f"{key}.json"
 
 
-def read_cache(key: str) -> BatchOut | None:
-    path = _cache_path(key)
+def read_cache(key: str, cache_dir: Path | None = None) -> BatchOut | None:
+    path = _cache_path(key, cache_dir)
     if not path.is_file():
         return None
     try:
@@ -726,15 +728,22 @@ def read_cache(key: str) -> BatchOut | None:
         return None
 
 
-def write_cache(key: str, model: str, text: str, usage: dict[str, int]) -> None:
-    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+def write_cache(
+    key: str,
+    model: str,
+    text: str,
+    usage: dict[str, int],
+    cache_dir: Path | None = None,
+) -> None:
+    directory = cache_dir or CACHE_DIR
+    directory.mkdir(parents=True, exist_ok=True)
     payload = {
         "model": model,
         "created": datetime.now(timezone.utc).isoformat(),
         "usage": usage,
         "text": text,
     }
-    _cache_path(key).write_text(
+    _cache_path(key, directory).write_text(
         json.dumps(payload, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
@@ -915,12 +924,13 @@ def enrich_batch_live(
     use_cache: bool,
     *,
     allow_model_switch: bool = True,
+    cache_dir: Path | None = None,
 ) -> BatchOut:
     payload = _batch_payload(batch)
     key = _cache_key(model, payload)
     expected = [row.row_id for row in batch]
     if use_cache:
-        cached = read_cache(key)
+        cached = read_cache(key, cache_dir)
         if cached is not None:
             _require_ids(cached, expected)
             stats.cache_hits += 1
@@ -945,6 +955,7 @@ def enrich_batch_live(
                     stats,
                     use_cache,
                     allow_model_switch=False,
+                    cache_dir=cache_dir,
                 )
             raise
         try:
@@ -957,7 +968,7 @@ def enrich_batch_live(
             )
             continue
         if use_cache:
-            write_cache(key, model, parsed.model_dump_json(), usage)
+            write_cache(key, model, parsed.model_dump_json(), usage, cache_dir)
         return parsed
     raise EnrichmentError(
         "Lỗi Gemini API / Gemini API error: "
@@ -1059,6 +1070,8 @@ def enrich_rows(
     use_cache: bool,
     mock_path: Path,
     stats: RunStats,
+    cache_dir: Path | None = None,
+    on_progress: Callable[[int, int], None] | None = None,
 ) -> list[CleanRow]:
     if not sources:
         return []
@@ -1078,13 +1091,27 @@ def enrich_rows(
 
     cleaned: dict[int, CleanRow] = {}
     batches = [sources[index : index + batch_size] for index in range(0, len(sources), batch_size)]
-    progress = tqdm(batches, desc="Làm giàu / Enriching", unit="batch")
+    if on_progress is not None:
+        on_progress(0, len(batches))
+    progress = tqdm(
+        batches,
+        desc="Làm giàu / Enriching",
+        unit="batch",
+        disable=on_progress is not None,
+    )
     try:
-        for batch in progress:
+        for index, batch in enumerate(progress, start=1):
             if offline:
                 parsed = enrich_batch_offline(batch, mock or {})
             else:
-                parsed = enrich_batch_live(client, stats.model, batch, stats, use_cache)
+                parsed = enrich_batch_live(
+                    client,
+                    stats.model,
+                    batch,
+                    stats,
+                    use_cache,
+                    cache_dir=cache_dir,
+                )
             by_id = {item.row_id: item for item in parsed.rows}
             for source in batch:
                 model_row = by_id.get(source.row_id)
@@ -1093,6 +1120,8 @@ def enrich_rows(
                 else:
                     cleaned[source.row_id] = apply_model_row(source, model_row)
             progress.set_postfix(api=stats.api_calls, cache=stats.cache_hits, refresh=False)
+            if on_progress is not None:
+                on_progress(index, len(batches))
     finally:
         progress.close()
     ordered = [cleaned[source.row_id] for source in sources]
@@ -1185,6 +1214,14 @@ CLEAN_HEADERS = [
     "Trạng thái / Status",
     "Lý do / Reason",
 ]
+
+
+def clean_frame(rows: list[CleanRow]) -> pd.DataFrame:
+    """One row per enriched record, using the same columns as the Excel sheet."""
+    records = [_clean_values(row, number) for number, row in enumerate(rows, start=1)]
+    return pd.DataFrame(records, columns=CLEAN_HEADERS)
+
+
 CLEAN_WIDTHS = [
     12, 36, 40, 40, 18, 32, 28, 16, 14, 16,
     18, 20, 22, 20, 16, 42, 46, 36, 24, 36,
@@ -1193,6 +1230,23 @@ CLEAN_WIDTHS = [
 PRICE_COL = 12
 CONFIDENCE_COL = 23
 STATUS_COL = 24
+_FORMULA_PREFIXES = frozenset("=+-@\t\r")
+
+
+def _put_value(cell, value: object) -> None:
+    """Store strings as text when Excel would otherwise treat them as formulas."""
+    if isinstance(value, str) and value[:1] in _FORMULA_PREFIXES:
+        cell.value = value
+        cell.data_type = "s"
+        cell.quotePrefix = True
+        return
+    cell.value = value
+
+
+def _cell(ws: Worksheet, row: int, col: int, value: object = None):
+    cell = ws.cell(row, col)
+    _put_value(cell, value)
+    return cell
 
 
 def _style_header(ws: Worksheet, column_count: int) -> None:
@@ -1227,14 +1281,14 @@ def write_clean_sheet(wb: Workbook, rows: list[CleanRow]) -> None:
     ws.title = "Dữ liệu sạch · Clean data"
     ws.sheet_properties.tabColor = "1B4F72"
     for col, header in enumerate(CLEAN_HEADERS, start=1):
-        ws.cell(1, col, header)
+        _cell(ws, 1, col, header)
     for offset, row in enumerate(rows, start=1):
         excel_row = offset + 1
         values = _clean_values(row, offset)
         review = row.status != STATUS_OK
         row_fill = REVIEW_ROW if review else (OK_ROW if offset % 2 == 0 else ZEBRA)
         for col, value in enumerate(values, start=1):
-            cell = ws.cell(excel_row, col, value if value is not None else None)
+            cell = _cell(ws, excel_row, col, value if value is not None else None)
             cell.font = LABEL_FONT
             cell.alignment = CENTER if col in {1, 8, 10, 22, 23} else WRAP
             cell.border = THIN
@@ -1267,20 +1321,20 @@ def write_summary_sheet(
     ws = wb.create_sheet("Tổng hợp · Summary")
     ws.sheet_properties.tabColor = "148F77"
     ws.sheet_view.showGridLines = False
-    ws["A1"] = "Tổng hợp / Summary"
-    ws["A1"].font = TITLE_FONT
+    title = _cell(ws, 1, 1, "Tổng hợp / Summary")
+    title.font = TITLE_FONT
     ws.merge_cells("A1:B1")
-    ws["A2"] = "Cửa hàng / Shop: Tạp hóa An Bình (dữ liệu giả lập / fictional)"
-    ws["A3"] = f"Nguồn / Source: {source_name}"
-    ws["A2"].font = LABEL_FONT
-    ws["A3"].font = LABEL_FONT
+    shop = _cell(ws, 2, 1, "Cửa hàng / Shop: Tạp hóa An Bình (dữ liệu giả lập / fictional)")
+    source = _cell(ws, 3, 1, f"Nguồn / Source: {source_name}")
+    shop.font = LABEL_FONT
+    source.font = LABEL_FONT
 
-    ws["A5"] = "Danh mục / Category"
-    ws["B5"] = "Số dòng / Rows"
-    ws["A5"].font = HEADER_FONT
-    ws["B5"].font = HEADER_FONT
-    ws["A5"].fill = HEADER_FILL
-    ws["B5"].fill = HEADER_FILL
+    cat_header = _cell(ws, 5, 1, "Danh mục / Category")
+    count_header = _cell(ws, 5, 2, "Số dòng / Rows")
+    cat_header.font = HEADER_FONT
+    count_header.font = HEADER_FONT
+    cat_header.fill = HEADER_FILL
+    count_header.fill = HEADER_FILL
     counts: dict[str, int] = {vi: 0 for vi, _en in CATEGORIES}
     for row in rows:
         key = row.category_vi or CATEGORY_OTHER[0]
@@ -1288,8 +1342,8 @@ def write_summary_sheet(
     category_start = 6
     for offset, (vi_name, en_name) in enumerate(CATEGORIES):
         excel_row = category_start + offset
-        ws.cell(excel_row, 1, f"{vi_name} / {en_name}").font = LABEL_FONT
-        cell = ws.cell(excel_row, 2, counts.get(vi_name, 0))
+        _cell(ws, excel_row, 1, f"{vi_name} / {en_name}").font = LABEL_FONT
+        cell = _cell(ws, excel_row, 2, counts.get(vi_name, 0))
         cell.font = LABEL_FONT
         cell.alignment = Alignment(horizontal="right")
         ws.cell(excel_row, 1).border = THIN
@@ -1315,20 +1369,20 @@ def write_summary_sheet(
     ws.add_chart(chart, "D5")
 
     sentiment_row = category_end + 2
-    ws.cell(sentiment_row, 1, "Cảm xúc / Sentiment").font = SECTION_FONT
+    _cell(ws, sentiment_row, 1, "Cảm xúc / Sentiment").font = SECTION_FONT
     sentiment_counts = {"positive": 0, "neutral": 0, "negative": 0}
     for row in rows:
         sentiment_counts[row.sentiment] = sentiment_counts.get(row.sentiment, 0) + 1
     for offset, key in enumerate(("positive", "neutral", "negative"), start=1):
-        ws.cell(sentiment_row + offset, 1, SENTIMENT_LABELS[key]).font = LABEL_FONT
-        cell = ws.cell(sentiment_row + offset, 2, sentiment_counts[key])
+        _cell(ws, sentiment_row + offset, 1, SENTIMENT_LABELS[key]).font = LABEL_FONT
+        cell = _cell(ws, sentiment_row + offset, 2, sentiment_counts[key])
         cell.font = LABEL_FONT
         cell.alignment = Alignment(horizontal="right")
         ws.cell(sentiment_row + offset, 1).border = THIN
         cell.border = THIN
 
     quality_row = sentiment_row + 5
-    ws.cell(quality_row, 1, "Chất lượng / Quality").font = SECTION_FONT
+    _cell(ws, quality_row, 1, "Chất lượng / Quality").font = SECTION_FONT
     duplicates = sum(1 for row in rows if row.source.is_duplicate)
     quality = [
         ("Tổng dòng / Total rows", len(rows)),
@@ -1337,15 +1391,15 @@ def write_summary_sheet(
         ("Trùng / Duplicates", duplicates),
     ]
     for offset, (label, value) in enumerate(quality, start=1):
-        ws.cell(quality_row + offset, 1, label).font = LABEL_FONT
-        cell = ws.cell(quality_row + offset, 2, value)
+        _cell(ws, quality_row + offset, 1, label).font = LABEL_FONT
+        cell = _cell(ws, quality_row + offset, 2, value)
         cell.font = LABEL_FONT
         cell.alignment = Alignment(horizontal="right")
         ws.cell(quality_row + offset, 1).border = THIN
         cell.border = THIN
 
     api_row = quality_row + 6
-    ws.cell(api_row, 1, "API & cache").font = SECTION_FONT
+    _cell(ws, api_row, 1, "API & cache").font = SECTION_FONT
     mode = "Ngoại tuyến / Offline" if stats.offline else "Trực tuyến / Online"
     api_lines = [
         ("Chế độ / Mode", mode),
@@ -1358,8 +1412,8 @@ def write_summary_sheet(
         ("Thử lại / Retries", stats.retries),
     ]
     for offset, (label, value) in enumerate(api_lines, start=1):
-        ws.cell(api_row + offset, 1, label).font = LABEL_FONT
-        cell = ws.cell(api_row + offset, 2, value)
+        _cell(ws, api_row + offset, 1, label).font = LABEL_FONT
+        cell = _cell(ws, api_row + offset, 2, value)
         cell.font = LABEL_FONT
         if isinstance(value, int):
             cell.alignment = Alignment(horizontal="right")
@@ -1368,7 +1422,8 @@ def write_summary_sheet(
         cell.border = THIN
 
     note_row = api_row + len(api_lines) + 2
-    ws.cell(
+    _cell(
+        ws,
         note_row,
         1,
         "Token chỉ tính lần gọi API thật. Cache trúng không tốn token. "
@@ -1403,10 +1458,10 @@ def write_review_sheet(wb: Workbook, rows: list[CleanRow]) -> None:
     ]
     widths = [12, 16, 36, 18, 20, 42, 18, 55, 34]
     for col, header in enumerate(headers, start=1):
-        ws.cell(1, col, header)
+        _cell(ws, 1, col, header)
     flagged = [row for row in rows if row.status != STATUS_OK]
     if not flagged:
-        ws.cell(2, 1, "Không có dòng cần kiểm tra / No rows need review")
+        _cell(ws, 2, 1, "Không có dòng cần kiểm tra / No rows need review")
         ws.merge_cells("A2:I2")
     for offset, row in enumerate(flagged, start=1):
         excel_row = offset + 1
@@ -1423,7 +1478,7 @@ def write_review_sheet(wb: Workbook, rows: list[CleanRow]) -> None:
             row.status,
         ]
         for col, value in enumerate(values, start=1):
-            cell = ws.cell(excel_row, col, value)
+            cell = _cell(ws, excel_row, col, value)
             cell.font = LABEL_FONT
             cell.alignment = WRAP
             cell.border = THIN
@@ -1444,11 +1499,12 @@ def write_review_sheet(wb: Workbook, rows: list[CleanRow]) -> None:
 
 def write_workbook(
     rows: list[CleanRow],
-    dest: Path,
+    dest: Path | BinaryIO,
     stats: RunStats,
     source_name: str,
 ) -> None:
-    dest.parent.mkdir(parents=True, exist_ok=True)
+    if isinstance(dest, Path):
+        dest.parent.mkdir(parents=True, exist_ok=True)
     wb = Workbook()
     wb.properties.title = "Dữ liệu sạch / Clean data — Tạp hóa An Bình"
     wb.properties.creator = "ai-data-enrichment"
@@ -1607,6 +1663,7 @@ def run_pipeline(
     use_cache: bool = True,
     mock_path: Path = MOCK_PATH,
     preview_image: Path | None = None,
+    cache_dir: Path | None = None,
 ) -> RunStats:
     if batch_size < 1:
         raise EnrichmentError(
@@ -1638,6 +1695,7 @@ def run_pipeline(
         use_cache=use_cache,
         mock_path=mock_path,
         stats=stats,
+        cache_dir=cache_dir,
     )
     stats.ok = sum(1 for row in cleaned if row.status == STATUS_OK)
     stats.needs_review = stats.rows - stats.ok

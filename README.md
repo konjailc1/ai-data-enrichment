@@ -2,6 +2,33 @@
 
 Turn a messy Vietnamese mini-mart spreadsheet into a clean, bilingual Excel report. Prices and phone numbers are normalized with rules. Product names, post-July 2025 Hanoi addresses, and review sentiment go to Gemini in batches, then come back as validated JSON.
 
+## Live demo
+
+The same pipeline runs in the browser on Streamlit Community Cloud:
+
+[https://ai-data-enrichment.streamlit.app](https://ai-data-enrichment.streamlit.app)
+
+![Streamlit demo](sample_output/app_screenshot.png)
+
+*Bản demo Streamlit — dữ liệu mẫu, 0 lần gọi API, 35 OK / 5 cần kiểm tra. / Streamlit demo — sample data, 0 API calls, 35 OK / 5 need review.*
+
+Sample data is instant and makes no API calls. An uploaded file is limited to 50 rows and 1 MB, with 3 live runs per browser session and a shared cap of 100 API calls per day.
+
+### Run the web app locally
+
+```powershell
+.\.venv\Scripts\python.exe -m streamlit run app.py
+```
+
+Streamlit prints a local URL, usually `http://localhost:8501`. Sample data works with no key. A live upload reads `GEMINI_API_KEY` from `.streamlit/secrets.toml` if that file exists, otherwise from the environment or `.env`. Copy `.streamlit/secrets.toml.example` and leave the value empty to keep using `.env`.
+
+### Deploy on Streamlit Community Cloud
+
+1. Connect the GitHub repo.
+2. Set the main file to `app.py`.
+3. In Settings → Secrets, add `GEMINI_API_KEY = "your_key_here"`.
+4. Choose Python 3.12.
+
 ![Clean data sheet](sample_output/screenshot.png)
 
 *Tạp hóa An Bình — Dữ liệu sạch / Clean data. Green is OK, orange needs a person.*
@@ -33,7 +60,7 @@ Five of the 40 sample rows land on the review sheet: a duplicate, an unparseable
 
 ## Tech stack
 
-Python 3.15, `google-genai`, Pydantic, pandas, openpyxl, python-dotenv, tqdm, matplotlib.
+Python 3.15, `google-genai`, Pydantic, pandas, openpyxl, python-dotenv, tqdm, matplotlib, Streamlit.
 
 ## Setup
 
@@ -50,7 +77,7 @@ Put a key from [Google AI Studio](https://aistudio.google.com/apikey) in `.env`:
 GEMINI_API_KEY=your_key_here
 ```
 
-The key is loaded with python-dotenv. It is never printed. `.gitignore` already ignores `.env`, `.venv/`, `output/`, and `cache/`.
+The key is loaded with python-dotenv. It is never printed. `.gitignore` already ignores `.env`, `.venv/`, `output/`, `cache/`, and `.streamlit/secrets.toml`.
 
 This folder already has a `.venv`. Use that interpreter rather than creating another one:
 
@@ -103,17 +130,22 @@ The live sample (40 rows, batch size 15, `gemini-3.5-flash-lite`) was **3 API ca
 
 ```
 ai-data-enrichment/
+├── app.py                  Streamlit demo
 ├── main.py                 CLI
 ├── enrich.py               rules, Gemini batches, cache, workbook
 ├── make_samples.py         fictional shop workbook + offline mock
 ├── requirements.txt
 ├── .env.example
+├── .streamlit/
+│   ├── config.toml
+│   └── secrets.toml.example
 ├── tests/test_normalize.py
 ├── sample_input/shop_data.xlsx
 └── sample_output/
     ├── enriched.xlsx       live run, copied for the README
     ├── mock_responses.json
-    └── screenshot.png
+    ├── screenshot.png
+    └── app_screenshot.png
 ```
 
 `output/` and `cache/` are local and gitignored.
